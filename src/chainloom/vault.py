@@ -41,7 +41,6 @@ class ImportCancelled(UserError):
 class ImportRow:
     private_key: str = field(repr=False)
     name: str = ""
-    group: str = ""
     address: str = ""
     line: int = 0
 
@@ -75,8 +74,6 @@ def parse_import(content: str) -> list[ImportRow]:
         "私钥": "private_key",
         "name": "name",
         "名称": "name",
-        "group": "group",
-        "分组": "group",
         "address": "address",
         "地址": "address",
     }
@@ -88,10 +85,12 @@ def parse_import(content: str) -> list[ImportRow]:
             raise UserError(f"第 {line} 行的 CSV 格式不正确，请检查引号及分隔符。") from None
 
     header = columns(lines[0][1], lines[0][0])
+    if any(item.strip().lower() in {"group", "分组"} for item in header):
+        raise UserError("CSV 不再支持 group / 分组列，请删除该列，并在导入窗口选择统一分组。")
     mapped = [aliases.get(item.strip().lower()) for item in header]
     if "private_key" in mapped:
         if None in mapped or len(set(mapped)) != len(mapped):
-            raise UserError("CSV 表头请使用 private_key、name、group、address，或对应的中文字段。")
+            raise UserError("CSV 表头请使用 private_key、name、address，或对应的中文字段。")
         rows = []
         # One wallet per physical line: reject multiline/ambiguous records.
         for number, line in lines[1:]:
@@ -102,7 +101,7 @@ def parse_import(content: str) -> list[ImportRow]:
             rows.append(ImportRow(**item, line=number))
     else:
         if any("," in line or "\t" in line for _, line in lines):
-            raise UserError("多列内容需要 CSV 表头，例如：private_key,name,group,address。")
+            raise UserError("多列内容需要 CSV 表头，例如：private_key,name,address。")
         rows = [ImportRow(private_key=value, line=number) for number, value in lines]
     if not rows or len(rows) > MAX_IMPORT_ROWS:
         raise UserError(f"每批请导入 1–{MAX_IMPORT_ROWS} 个钱包。")
@@ -117,7 +116,13 @@ def _private_operation(function):
             supplied = args[0]
         with self._mutex:
             current = bytes(self._password) if self._password is not None else None
-        with sensitive_errors(supplied, current):
+        changing = function.__name__ == "change_password"
+        secrets = (
+            (kwargs.get("current_password", args[0] if args else None),
+             kwargs.get("new_password", args[1] if len(args) > 1 else None))
+            if changing else ()
+        )
+        with sensitive_errors(supplied, current, *secrets):
             return function(self, *args, **kwargs)
 
     return wrapped
@@ -304,6 +309,85 @@ class WalletVault:
             self._password = bytearray(password.encode("utf-8"))
             record_operation("解锁钱包库成功")
 
+    @_private_operation
+    def change_password(self, current_password: str, new_password: str, cancelled=None,
+                        progress=None):
+        """Re-encrypt all keys, then atomically replace ciphertext and verifier."""
+        def check_rotation(generation=None):
+            if cancelled is not None and cancelled.is_set():
+                raise ImportCancelled()
+            if generation is not None and generation != self._generation:
+                raise VaultLocked()
+
+        if not 12 <= len(new_password) <= 256:
+            raise UserError("钱包库密码请使用 12–256 个字符。")
+        if current_password == new_password:
+            raise UserError("新密码不能与当前密码相同。")
+        with self._mutex, self._connection() as connection:
+            check_rotation()
+            generation = self._generation
+            was_unlocked = self._password is not None
+            verifier = connection.execute(
+                "SELECT value FROM vault_meta WHERE key='password_check'"
+            ).fetchone()[0]
+            original = [tuple(row) for row in connection.execute(
+                "SELECT address,keystore FROM wallets ORDER BY address"
+            )]
+        try:
+            key = bytearray(Account.decrypt(json.loads(verifier), current_password))
+        except (ValueError, TypeError, KeyError):
+            raise UserError("当前密码不正确，或钱包库文件已损坏。") from None
+        key[:] = b"\0" * len(key)
+        encrypted = []
+        for index, (address, keystore) in enumerate(original, 1):
+            with self._mutex:
+                check_rotation(generation)
+            key = None
+            try:
+                key = bytearray(Account.decrypt(json.loads(keystore), current_password))
+                if Account.from_key(key).address.lower() != address.lower():
+                    raise ValueError("Address mismatch")
+                replacement = Account.encrypt(
+                    bytes(key), new_password, kdf="scrypt", iterations=SCRYPT_N
+                )
+                encrypted.append((json.dumps(replacement), address))
+            except (ValueError, TypeError, KeyError):
+                raise UserError("钱包无法重新加密，本次未修改密码，请检查钱包库文件。") from None
+            finally:
+                if key is not None:
+                    key[:] = b"\0" * len(key)
+            if progress:
+                progress(index, len(original))
+        with self._mutex:
+            check_rotation(generation)
+        replacement_verifier = json.dumps(Account.encrypt(
+            secrets.token_bytes(32), new_password, kdf="scrypt", iterations=SCRYPT_N
+        ))
+        with self._mutex, self._connection() as connection, connection:
+            check_rotation(generation)
+            connection.execute("BEGIN IMMEDIATE")
+            # Importing or another process changing the password must not leave
+            # any wallet encrypted with a different password.
+            latest = [tuple(row) for row in connection.execute(
+                "SELECT address,keystore FROM wallets ORDER BY address"
+            )]
+            latest_verifier = connection.execute(
+                "SELECT value FROM vault_meta WHERE key='password_check'"
+            ).fetchone()[0]
+            if latest != original or latest_verifier != verifier:
+                raise UserError("钱包库内容已变更，本次未修改密码，请重试。")
+            connection.executemany("UPDATE wallets SET keystore=? WHERE address=?", encrypted)
+            connection.execute(
+                "UPDATE vault_meta SET value=? WHERE key='password_check'",
+                (replacement_verifier,),
+            )
+            connection.commit()
+            if self._password is not None:
+                self._password[:] = b"\0" * len(self._password)
+            self._password = bytearray(new_password.encode("utf-8")) if was_unlocked else None
+            self._generation += 1
+        record_operation("修改钱包库密码成功")
+
     def wallets(self, search="", group_id=None):
         with self._mutex, self._connection() as connection:
             self._check()
@@ -381,18 +465,28 @@ class WalletVault:
         )
 
     @_private_operation
-    def import_wallets(
-        self, rows: list[ImportRow], default_group="未分组", cancelled=None, progress=None
-    ):
+    def import_wallets(self, rows: list[ImportRow], group_id=None, cancelled=None, progress=None):
         if not 1 <= len(rows) <= MAX_IMPORT_ROWS:
             raise UserError(f"每批请导入 1–{MAX_IMPORT_ROWS} 个钱包。")
-        default_group = clean_label(default_group, "分组名称", 60) or "未分组"
         with self._mutex, self._connection() as connection:
             self._check(cancelled=cancelled)
+            if group_id is None:
+                selected = connection.execute(
+                    "SELECT id,name FROM wallet_groups WHERE name='未分组'"
+                ).fetchone()
+            else:
+                if type(group_id) is not int:
+                    raise UserError("请选择一个有效的导入分组。")
+                selected = connection.execute(
+                    "SELECT id,name FROM wallet_groups WHERE id=?", (group_id,)
+                ).fetchone()
+            if selected is None:
+                raise UserError("所选分组不存在，请重新选择。")
+            group_id, group_name = selected["id"], selected["name"]
             generation = self._generation
             password = bytearray(self._password)
             seen = {row[0].lower() for row in connection.execute("SELECT address FROM wallets")}
-        record_operation("开始批量导入钱包", 总行数=len(rows), 默认分组=default_group)
+        record_operation("开始批量导入钱包", 总行数=len(rows), 导入分组=group_name)
         encrypted, invalid, duplicates = [], [], 0
         try:
             for index, row in enumerate(rows, 1):
@@ -415,14 +509,13 @@ class WalletVault:
                         clean_label(row.name, "钱包名称", 80)
                         or f"钱包 {account.address[:8]}…{account.address[-4:]}"
                     )
-                    group = clean_label(row.group, "分组名称", 60) or default_group
                     if account.address.lower() in seen:
                         duplicates += 1
                     else:
                         keystore = Account.encrypt(
                             account.key, bytes(password), kdf="scrypt", iterations=SCRYPT_N
                         )
-                        encrypted.append((account.address, name, group, json.dumps(keystore)))
+                        encrypted.append((account.address, name, json.dumps(keystore)))
                         seen.add(account.address.lower())
                 except UserError as error:
                     invalid.append((row.line or index, str(error)))
@@ -432,20 +525,20 @@ class WalletVault:
             added_wallets = []
             with self._mutex, self._connection() as connection, connection:
                 self._check(generation, cancelled)
-                for wallet_address, name, group, keystore in encrypted:
-                    connection.execute(
-                        "INSERT OR IGNORE INTO wallet_groups(name) VALUES (?)", (group,)
-                    )
-                    group_id = connection.execute(
-                        "SELECT id FROM wallet_groups WHERE name=?", (group,)
-                    ).fetchone()[0]
+                if not connection.execute(
+                    "SELECT 1 FROM wallet_groups WHERE id=?", (group_id,)
+                ).fetchone():
+                    raise UserError("所选分组不存在，本次内容未写入，请重新选择。")
+                for wallet_address, name, keystore in encrypted:
                     cursor = connection.execute(
                         "INSERT OR IGNORE INTO wallets(address,name,group_id,keystore) VALUES (?,?,?,?)",
                         (wallet_address, name, group_id, keystore),
                     )
                     added += cursor.rowcount
                     if cursor.rowcount:
-                        added_wallets.append({"地址": wallet_address, "名称": name, "分组": group})
+                        added_wallets.append(
+                            {"地址": wallet_address, "名称": name, "分组": group_name}
+                        )
                     if not cursor.rowcount:
                         duplicates += 1
             record_operation(

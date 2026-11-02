@@ -31,6 +31,7 @@ from ..diagnostics import log_directory, record_exception, record_operation
 from ..errors import UserError
 from ..time_format import format_beijing_time
 from ..transfer import address
+from .batch_page import BatchPage
 from .dialogs import ConfirmDialog, TokenDialog
 from .service import DesktopService, format_units, friendly_error
 from .settings import HISTORY_NETWORKS, NETWORKS, Asset, Preferences, save_preferences
@@ -116,6 +117,7 @@ class MainWindow(QMainWindow):
         for index, title in (
             (3, "▣    钱包管理"),
             (0, "↗    转账"),
+            (4, "⇉    批量转账"),
             (1, "◷    交易记录"),
             (2, "⚙    设置"),
         ):
@@ -135,6 +137,10 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._settings_page())
         self.wallet_page = WalletManagementPage(self.directory, self._task, self)
         self.stack.addWidget(self.wallet_page)
+        self.batch_page = BatchPage(self)
+        self.stack.addWidget(self.batch_page)
+        self.batch_page.history_changed.connect(self.load_history)
+        self.wallet_page.batch_requested.connect(self._batch_from_wallets)
         self.stack.setCurrentIndex(3)
         root_box.addWidget(self.stack, 1)
         self.setCentralWidget(root)
@@ -145,7 +151,7 @@ class MainWindow(QMainWindow):
             lambda: QMessageBox.information(
                 self,
                 "关于 Chainloom",
-                "Chainloom 0.1.0\n本地钱包管理与 EVM 单次转账工具",
+                "Chainloom 0.1.0\n本地钱包管理与 EVM 单次及批量转账工具",
             )
         )
         menu.addAction(about)
@@ -227,7 +233,7 @@ class MainWindow(QMainWindow):
         form_box.addWidget(self.recipient)
         self.address_hint = text("请选择相同网络的收款地址", "muted")
         form_box.addWidget(self.address_hint)
-        form_box.addWidget(text("转账金额", "fieldLabel"))
+        form_box.addWidget(text("转账数量", "fieldLabel"))
         self.amount = QLineEdit()
         self.amount.setObjectName("amount")
         self.amount.setPlaceholderText("0.00")
@@ -319,7 +325,7 @@ class MainWindow(QMainWindow):
         self.history_table = QTableWidget(0, 8)
         self.history_table.setObjectName("historyTable")
         self.history_table.setHorizontalHeaderLabels(
-            ["选择", "时间（北京时间）", "网络", "金额", "状态", "发送地址", "收款地址", "交易哈希"]
+            ["选择", "时间（北京时间）", "网络", "数量", "状态", "发送地址", "收款地址", "交易哈希"]
         )
         self.history_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.history_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -352,45 +358,73 @@ class MainWindow(QMainWindow):
         return page
 
     def _settings_page(self):
-        page, layout = self._page("设置", "配置保存在本机；无需部署业务服务器。")
-        layout.addWidget(text("网络节点 · 高级设置", "fieldLabel"))
-        layout.addWidget(
-            text("留空使用内置公共节点及备用节点。自定义节点只影响当前 Mac。", "muted", True)
-        )
+        page, layout = self._page("设置", "管理钱包库安全、网络连接及本地文件。")
+        page.setObjectName("settingsPage")
+
+        def section(title, description):
+            layout.addSpacing(12)
+            card = QFrame()
+            card.setObjectName("settingsSection")
+            content = box(card, margins=(22, 20, 22, 20), spacing=12)
+            content.addWidget(text(title, "settingsSectionTitle"))
+            content.addWidget(text(description, "settingsDescription", True))
+            layout.addWidget(card)
+            return content
+
+        def action(label, callback, primary=False):
+            button = QPushButton(label)
+            button.setProperty("settingsAction", True)
+            if primary:
+                button.setObjectName("primary")
+            button.clicked.connect(callback)
+            return button
+
+        security = section("钱包库安全", "验证当前密码后即可设置新密码，无需先解锁钱包库。")
+        self.change_password_button = action("修改钱包库密码", self._change_vault_password)
+        security.addWidget(row(self.change_password_button, None))
+
+        network = section("网络节点", "留空使用内置公共节点及备用节点。自定义节点只影响当前 Mac。")
         self.rpc_inputs = {}
         for name, info in NETWORKS.items():
-            layout.addWidget(text(info.title, "muted"))
+            field = QWidget()
+            field_layout = box(field, spacing=6)
+            field_layout.addWidget(text(info.title, "settingsFieldLabel"))
             entry = QLineEdit(self.preferences.rpc_overrides.get(name, ""))
             entry.setPlaceholderText(info.rpcs[0])
             entry.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
             self.rpc_inputs[name] = entry
-            layout.addWidget(entry)
-        save = QPushButton("保存设置")
-        save.setObjectName("primary")
-        save.clicked.connect(self._save_settings)
-        layout.addWidget(row(save, None))
-        folder = QPushButton("打开本地数据文件夹")
-        folder.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.directory)))
-        )
-        layout.addWidget(row(folder, None))
-        layout.addWidget(text("钱包库与交易记录保存在：\n" + str(self.directory), "muted", True))
+            field_layout.addWidget(entry)
+            network.addWidget(field)
+        network.addWidget(row(action("保存设置", self._save_settings, primary=True), None))
+
+        storage = section("本地数据", "钱包库与交易记录保存在本机。")
+        data_path = text(str(self.directory), "settingsPath", True)
+        data_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        storage.addWidget(data_path)
+        storage.addWidget(row(action("打开本地数据文件夹", lambda: QDesktopServices.openUrl(
+            QUrl.fromLocalFile(str(self.directory))
+        )), None))
+
+        logs = section("日志与诊断", "操作遇到问题时，可打开日志文件夹查看错误详情。")
         self.log_directory = log_directory()
-        self.log_folder_button = QPushButton("打开日志文件夹")
-        self.log_folder_button.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.log_directory)))
-        )
-        layout.addWidget(row(self.log_folder_button, None))
-        self.log_path_label = text(
-            "错误日志：\n" + str(self.log_directory / "chainloom.log"), "muted", True
-        )
+        self.log_path_label = text(str(self.log_directory / "chainloom.log"), "settingsPath", True)
         self.log_path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.log_path_label)
+        logs.addWidget(self.log_path_label)
+        self.log_folder_button = action("打开日志文件夹", lambda: QDesktopServices.openUrl(
+            QUrl.fromLocalFile(str(self.log_directory))
+        ))
+        logs.addWidget(row(self.log_folder_button, None))
         layout.addStretch()
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(page)
         return scroll
+
+    def _change_vault_password(self):
+        if self.busy or self.batch_page.running or self.batch_page.previewing:
+            self.notify("请等待当前转账操作完成或暂停批量任务后再修改密码。")
+            return
+        self.wallet_page.change_password()
 
     def navigate(self, index):
         self.navigation.button(index).setChecked(True)
@@ -399,6 +433,13 @@ class MainWindow(QMainWindow):
             self.load_history()
         if index == 0:
             self._set_accounts()
+        if index == 4:
+            self.batch_page.refresh_wallets()
+            self.batch_page.reload_history()
+
+    def _batch_from_wallets(self, addresses):
+        self.navigate(4)
+        self.batch_page.use_wallets(addresses)
 
     def _task(self, function, args=(), success=None, failure=None):
         import uuid
@@ -466,6 +507,7 @@ class MainWindow(QMainWindow):
 
     def _local_wallet_changed(self, *_):
         self._set_accounts()
+        self.batch_page.refresh_wallets()
         if not self.wallet_page.vault.unlocked and self.confirm_dialog is not None:
             self.confirm_dialog.reject()
 
@@ -604,6 +646,12 @@ class MainWindow(QMainWindow):
         self._update_history_actions()
 
     def _prepare(self):
+        if self.wallet_page.busy:
+            self.notify("钱包库正在处理，请稍候再转账。")
+            return
+        if self.batch_page.running or self.batch_page.previewing:
+            self.notify("批量任务正在执行，请先暂停后再进行单次转账。")
+            return
         if self.busy:
             return
         vault = self.wallet_page.vault
@@ -641,7 +689,9 @@ class MainWindow(QMainWindow):
                 )
             else:
                 total = int(quote.prepared.preview["amount_units"]) + fee
-                self.preview_total.setText(f"金额 + 预估执行手续费\n{format_units(total)} {native}")
+                self.preview_total.setText(
+                    f"转账数量 + 预估执行手续费\n{format_units(total)} {native}"
+                )
             self.confirm_dialog = ConfirmDialog(quote, self)
             try:
                 accepted = self.confirm_dialog.exec() == QDialog.DialogCode.Accepted
@@ -738,6 +788,10 @@ class MainWindow(QMainWindow):
                 item = QTableWidgetItem(display)
                 item.setData(Qt.ItemDataRole.UserRole, value)
                 tooltip = value or "尚未获得交易哈希"
+                if details.get("batch_id"):
+                    tooltip += (
+                        f"\n所属批次：{details['batch_id']} · 第 {details['batch_position']} 笔"
+                    )
                 if column in HISTORY_COPY_FIELDS and value:
                     tooltip += "\n双击或右键复制完整内容"
                 item.setToolTip(tooltip)
@@ -795,8 +849,17 @@ class MainWindow(QMainWindow):
         action.setEnabled(bool(value))
         # Capture the full value now; polling may refresh/reorder rows while the menu is open.
         action.triggered.connect(lambda: self._copy_history_value(value, label))
+        record = self._selected_record()
+        batch_id = record["details"].get("batch_id") if record else None
+        if batch_id:
+            batch = menu.addAction("查看所属批次")
+            batch.triggered.connect(lambda: self._open_batch(batch_id))
         menu.exec(self.history_table.viewport().mapToGlobal(position))
         menu.deleteLater()
+
+    def _open_batch(self, batch_id):
+        self.navigate(4)
+        self.batch_page.reload_history(batch_id)
 
     def _checked_records(self):
         return [
@@ -998,13 +1061,13 @@ class MainWindow(QMainWindow):
             f"请求编号：{record['request_id']}\n时间（北京时间 UTC+8）：{format_beijing_time(record['created_at'])}\n"
             f"网络：{HISTORY_NETWORKS[record['network']].title}\n"
             f"发送地址：{record['sender']}\n收款地址：{details['to']}\n"
-            f"金额：{details['amount']} {details.get('symbol', '')}\n"
+            f"数量：{details['amount']} {details.get('symbol', '')}\n"
             f"交易哈希：{record['tx_hash'] or '尚未获得'}\n状态：{STATES.get(record['state'], record['state'])}"
         )
         self._notify_copied("交易详情")
 
     def _save_settings(self):
-        if self.busy:
+        if self.busy or self.batch_page.running or self.batch_page.previewing:
             self.notify("请等待当前钱包请求完成后再修改设置。")
             return
         try:
@@ -1023,11 +1086,15 @@ class MainWindow(QMainWindow):
             return
         self.preferences = preferences
         self.backend = DesktopService(self.directory, preferences, cancelled=self.stop_event)
+        self.batch_page.service.backend = self.backend
         self.notify("设置已保存。")
         self._edited()
         self.balance_timer.start()
 
     def _add_token(self):
+        if self.busy or self.batch_page.running or self.batch_page.previewing:
+            self.notify("请先完成预览或暂停转账任务，再添加代币。")
+            return
         dialog = TokenDialog(self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -1062,6 +1129,8 @@ class MainWindow(QMainWindow):
             self.backend = DesktopService(
                 self.directory, self.preferences, cancelled=self.stop_event
             )
+            self.batch_page.service.backend = self.backend
+            self.batch_page.assets_changed()
             if name == self.network_name():
                 self._network_changed()
                 self.asset.setCurrentIndex(self.asset.count() - 1)
@@ -1076,7 +1145,7 @@ class MainWindow(QMainWindow):
         if self.closing:
             event.ignore()
             return
-        if self.busy:
+        if self.busy or self.batch_page.running:
             answer = QMessageBox.question(
                 self,
                 "仍有操作正在进行",
@@ -1094,6 +1163,7 @@ class MainWindow(QMainWindow):
         if self.closing:
             return
         self.closing = True
+        self.batch_page.shutdown()
         self.wallet_page.shutdown()
         self.stop_event.set()
         self.poll_timer.stop()

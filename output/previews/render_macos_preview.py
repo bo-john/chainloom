@@ -197,7 +197,7 @@ def build():
     fb.addSpacing(7)
     fb.addWidget(label("✓  地址格式正确", 10, "#71907A"))
     fb.addSpacing(20)
-    fb.addWidget(label("转账金额", 12, "#59695F", 550))
+    fb.addWidget(label("转账数量", 12, "#59695F", 550))
     fb.addSpacing(9)
     fb.addWidget(field(row(label("0.025", 28, INK, 500), None,
                            label("ETH", 13, "#738278", 500)), 76))

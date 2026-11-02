@@ -27,7 +27,7 @@ class ConfirmDialog(QDialog):
             ("网络", f"{info.title}  ·  Chain ID {info.chain_id}"),
             ("发送地址", prepared.request.sender),
             ("收款地址", prepared.request.recipient),
-            ("转账金额", f"{prepared.request.amount} {quote.asset.symbol}"),
+            ("转账数量", f"{prepared.request.amount} {quote.asset.symbol}"),
             ("代币合约", quote.asset.contract or f"{info.symbol} 原生币"),
             (
                 "执行手续费上限",
@@ -41,7 +41,7 @@ class ConfirmDialog(QDialog):
         layout.addLayout(form)
         layout.addWidget(
             text(
-                "确认后使用所选本地钱包签名并发送。请核对地址、网络、金额和手续费。"
+                "确认后使用所选本地钱包签名并发送。请核对地址、网络、数量和手续费。"
                 + (" L2 网络还可能收取 L1 数据费。" if quote.network in {"base", "xlayer"} else ""),
                 "muted",
                 True,

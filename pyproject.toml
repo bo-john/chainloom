@@ -1,7 +1,7 @@
 [project]
 name = "chainloom"
 version = "0.1.0"
-description = "Local desktop application for encrypted wallets and single EVM transfers"
+description = "Local desktop application for encrypted wallets and EVM transfers"
 requires-python = ">=3.13"
 dependencies = [
     "pyside6==6.10.2",

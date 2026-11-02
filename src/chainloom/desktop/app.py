@@ -95,6 +95,7 @@ def _run(app, args, directory, logfile):
     finally:
         window.stop_event.set()
         window.pool.waitForDone()
+        window.batch_page.shutdown()
         window.wallet_page.shutdown()
         signals.close()
     return result

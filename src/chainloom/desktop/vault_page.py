@@ -87,8 +87,65 @@ class VaultPasswordDialog(QDialog):
         super().reject()
 
 
+class ChangeVaultPasswordDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("修改钱包库密码")
+        self.setMinimumWidth(460)
+        layout = box(self, margins=(26, 24, 26, 24), spacing=14)
+        layout.addWidget(text("修改钱包库密码", "brand"))
+        layout.addWidget(text(
+            "全部钱包将使用新密码重新加密。修改成功后钱包库会锁定，请使用新密码解锁。"
+            "新密码请使用 12–256 个字符，遗忘后无法恢复。", "muted", True
+        ))
+        self.current_password = QLineEdit()
+        self.new_password = QLineEdit()
+        self.repeat = QLineEdit()
+        for entry, placeholder in (
+            (self.current_password, "当前密码"),
+            (self.new_password, "新密码（至少 12 个字符）"),
+            (self.repeat, "再次输入新密码"),
+        ):
+            entry.setEchoMode(QLineEdit.EchoMode.Password)
+            entry.setMaxLength(256)
+            entry.setPlaceholderText(placeholder)
+            layout.addWidget(entry)
+        self.error = text("", "muted", True)
+        layout.addWidget(self.error)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("修改密码")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setObjectName("primary")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def accept(self):
+        if not self.current_password.text():
+            self.error.setText("请输入当前密码。")
+        elif not 12 <= len(self.new_password.text()) <= 256:
+            self.error.setText("新密码请使用 12–256 个字符。")
+        elif self.new_password.text() != self.repeat.text():
+            self.error.setText("两次输入的新密码不一致。")
+        elif self.current_password.text() == self.new_password.text():
+            self.error.setText("新密码不能与当前密码相同。")
+        else:
+            super().accept()
+
+    def clear_secrets(self):
+        self.current_password.clear()
+        self.new_password.clear()
+        self.repeat.clear()
+
+    def reject(self):
+        self.clear_secrets()
+        super().reject()
+
+
 class WalletImportDialog(QDialog):
-    def __init__(self, groups, parent=None):
+    def __init__(self, groups, parent=None, group_id=None):
         super().__init__(parent)
         self.setWindowTitle("批量导入钱包")
         self.resize(660, 500)
@@ -97,7 +154,7 @@ class WalletImportDialog(QDialog):
         layout.addWidget(text("导入已有私钥", "brand"))
         layout.addWidget(
             text(
-                "TXT：每行一个私钥。CSV：表头使用 private_key,name,group,address；"
+                "TXT：每行一个私钥。CSV：表头使用 private_key,name,address；"
                 "除 private_key 外均可省略。地址会由私钥校验。",
                 "muted",
                 True,
@@ -117,10 +174,16 @@ class WalletImportDialog(QDialog):
         self.editor.setPlaceholderText("点击上方按钮粘贴或选择文件。导入内容默认隐藏。")
         layout.addWidget(self.editor, 1)
         self.group = QComboBox()
-        self.group.setEditable(True)
+        self.group.setEditable(False)
         for item in groups:
-            self.group.addItem(item["name"])
-        layout.addWidget(row(text("默认分组", "fieldLabel"), self.group))
+            self.group.addItem(item["name"], item["id"])
+        selected = self.group.findData(group_id)
+        if selected >= 0:
+            self.group.setCurrentIndex(selected)
+        layout.addWidget(row(text("导入分组", "fieldLabel"), self.group))
+        layout.addWidget(
+            text("本次新增钱包统一归入所选分组。如需新分组，请先在钱包管理中新建。", "muted", True)
+        )
         layout.addWidget(
             text("仅在本机处理。无效行和重复钱包会跳过；中途取消不会写入本批钱包。", "muted", True)
         )
@@ -135,6 +198,7 @@ class WalletImportDialog(QDialog):
         self.submit_button.setObjectName("primary")
         self.submit_button.setEnabled(False)
         self.editor.textChanged.connect(self._source_changed)
+        self.group.currentIndexChanged.connect(self._source_changed)
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -148,7 +212,9 @@ class WalletImportDialog(QDialog):
         self.error.show()
 
     def _source_changed(self):
-        self.submit_button.setEnabled(bool(self.content().strip()))
+        self.submit_button.setEnabled(
+            bool(self.content().strip()) and self.group.currentData() is not None
+        )
 
     def paste_source(self):
         self.set_source(QApplication.clipboard().text())
@@ -156,6 +222,8 @@ class WalletImportDialog(QDialog):
     def accept(self):
         try:
             parse_import(self.content())
+            if self.group.currentData() is None:
+                raise UserError("请选择导入分组；如无分组，请先在钱包管理中新建。")
         except UserError as error:
             record_exception("校验钱包导入内容", error)
             self._feedback(str(error))
@@ -222,6 +290,7 @@ class WalletImportDialog(QDialog):
 
 class WalletManagementPage(QWidget):
     state_changed = Signal(str)
+    batch_requested = Signal(list)
     import_progress = Signal(int, int, int)
     AUTO_LOCK_SECONDS = 300
 
@@ -294,6 +363,10 @@ class WalletManagementPage(QWidget):
         self.rename_button.clicked.connect(self.rename_wallet)
         self.copy_button = QPushButton("复制地址")
         self.copy_button.clicked.connect(self.copy_address)
+        self.batch_button = QPushButton("批量转账")
+        self.batch_button.clicked.connect(
+            lambda: self.batch_requested.emit(self.selected_addresses())
+        )
         tools.addWidget(
             row(
                 self.import_button,
@@ -301,6 +374,7 @@ class WalletManagementPage(QWidget):
                 self.assign_group_button,
                 self.rename_button,
                 self.copy_button,
+                self.batch_button,
                 None,
             )
         )
@@ -489,8 +563,9 @@ class WalletManagementPage(QWidget):
         self.assign_group_button.setEnabled(bool(addresses))
         self.rename_button.setEnabled(len(addresses) == 1)
         self.copy_button.setEnabled(bool(addresses))
+        self.batch_button.setEnabled(bool(addresses))
 
-    def _run(self, operation, success, failure_title=None):
+    def _run(self, operation, success, failure_title=None, success_after_cancel=False):
         self.busy = True
         self.operation = operation
         self.refresh()
@@ -499,7 +574,7 @@ class WalletManagementPage(QWidget):
             self.busy = False
             self.progress_bar.hide()
             self.operation = None
-            if operation.is_set():
+            if operation.is_set() and not success_after_cancel:
                 self.vault.lock()
                 self.notify("操作已停止，钱包库已锁定。")
             else:
@@ -550,6 +625,47 @@ class WalletManagementPage(QWidget):
 
         self.run_task(work, success=done, failure=failed)
 
+    def change_password(self):
+        if self.busy:
+            self.notify("请等待当前钱包库操作完成后再修改密码。")
+            return
+        if not self.vault.exists:
+            self.notify("请先在钱包管理中创建钱包库。")
+            return
+        dialog = ChangeVaultPasswordDialog(self)
+        self.active_dialog = dialog
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            current, new = dialog.current_password.text(), dialog.new_password.text()
+        finally:
+            dialog.clear_secrets()
+            dialog.deleteLater()
+            self.active_dialog = None
+        operation = Event()
+
+        def changed(_):
+            self.vault.lock()
+            self.notify("钱包库密码已修改，钱包库已锁定。请使用新密码解锁。", "success")
+
+        # A cancellation arriving after the database commit must still report
+        # that the new password took effect.
+        done, failed = self._run(operation, changed, success_after_cancel=True)
+        self.operation_id += 1
+        stamp = self.operation_id
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setFormat("正在重新加密钱包：%v / %m")
+        self.progress_bar.show()
+        self.notify("正在重新加密钱包，请稍候；可在钱包管理中取消操作并锁定。")
+
+        def work():
+            return self.vault.change_password(
+                current, new, cancelled=operation,
+                progress=lambda count, total: self.import_progress.emit(stamp, count, total),
+            )
+
+        self.run_task(work, success=done, failure=failed)
+
     def lock(self):
         if self.notification_dialog is not None:
             self.notification_dialog.reject()
@@ -574,13 +690,15 @@ class WalletManagementPage(QWidget):
     def import_wallets(self):
         if not self.vault.unlocked or self.busy:
             return
-        dialog = WalletImportDialog(self.vault.groups(), self)
+        dialog = WalletImportDialog(
+            self.vault.groups(), self, group_id=self.group_filter.currentData()
+        )
         self.active_dialog = dialog
         try:
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
             rows = parse_import(dialog.content())
-            default_group = dialog.group.currentText()
+            group_id = dialog.group.currentData()
         except (UserError, ValueError) as error:
             record_exception("解析批量导入内容", error)
             self._import_result(
@@ -608,7 +726,7 @@ class WalletManagementPage(QWidget):
         def work():
             return self.vault.import_wallets(
                 rows,
-                default_group,
+                group_id=group_id,
                 cancelled=operation,
                 progress=lambda count, total: self.import_progress.emit(stamp, count, total),
             )

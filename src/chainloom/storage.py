@@ -132,7 +132,7 @@ class Store:
             网络=network,
             发送地址=sender,
             收款地址=details.get("to"),
-            金额=details.get("amount"),
+            数量=details.get("amount"),
         )
 
     def wallet_get(self, request_id):
@@ -186,7 +186,7 @@ class Store:
             链编号=chain_id,
             发送地址=sender,
             收款地址=details.get("to"),
-            金额=details.get("amount"),
+            数量=details.get("amount"),
             资产=details.get("symbol", details.get("asset")),
             交易哈希=tx_hash,
             执行手续费上限=details.get("max_execution_fee_wei"),
