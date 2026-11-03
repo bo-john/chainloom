@@ -13,6 +13,7 @@ from ..diagnostics import (
     exception_hooks,
     record_exception,
 )
+from .macos import relaunch_as_app
 from .settings import load_preferences
 from .shutdown import TerminationSignals
 from .window import MainWindow
@@ -24,6 +25,9 @@ def main(argv=None):
     parser.add_argument("--screenshot", type=Path, help="Save an actual window screenshot and exit")
     parser.add_argument("--log-dir", type=Path, help="Override the standard desktop log directory")
     args = parser.parse_args(argv)
+    relaunch_as_app(sys.argv[1:] if argv is None else argv)
+    QApplication.setApplicationName("Chainloom")
+    QApplication.setApplicationDisplayName("Chainloom")
     app = QApplication(sys.argv[:1])
     app.setApplicationName("Chainloom")
     app.setOrganizationName("Chainloom")

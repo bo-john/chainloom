@@ -4,8 +4,10 @@ import csv
 import io
 from decimal import Decimal, localcontext
 from pathlib import Path
+from threading import Event
 
 from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -37,6 +39,7 @@ from ..batch import (
 )
 from ..errors import UserError
 from ..time_format import format_beijing_time
+from .address_review import review_addresses, review_warnings
 from .batch_service import BatchService
 from .service import format_units, friendly_error
 from .settings import NETWORKS
@@ -116,7 +119,7 @@ class WalletPicker(QDialog):
             for column, key in enumerate(("name", "address", "group_name"), 1):
                 self.table.setItem(index, column, item(wallet[key]))
         layout.addWidget(self.table)
-        select_all = QPushButton("勾选当前筛选结果")
+        select_all = self.select_all_button = QPushButton("勾选当前筛选结果")
         select_all.clicked.connect(self.select_visible)
         layout.addWidget(select_all)
         buttons = QDialogButtonBox(
@@ -174,7 +177,7 @@ class BatchApproval(QDialog):
                 True,
             )
         )
-        table = QTableWidget(len(preview["items"]), 4)
+        table = QTableWidget(len(preview["items"]), 5)
         configure_table(
             table,
             [
@@ -182,12 +185,18 @@ class BatchApproval(QDialog):
                 "收款地址（完整地址）",
                 "数量",
                 f"执行手续费上限（{info.symbol}）",
+                "地址核对",
             ],
         )
         for index, entry in enumerate(preview["items"]):
             for column, key in enumerate(("sender", "recipient", "amount", "fee_cap")):
                 value = format_units(int(entry[key])) if key == "fee_cap" else entry[key]
                 table.setItem(index, column, item(value))
+            review = preview.get("address_reviews", [{}] * len(preview["items"]))[index]
+            messages = review.get("warnings", []) + review.get("info", [])
+            table.setItem(index, 4, item("\n".join(messages) or "无地址提醒"))
+            table.setVerticalHeaderItem(index, item(f"第 {entry.get('position', index + 1)} 行"))
+        table.verticalHeader().show()
         table.setWordWrap(True)
         table.resizeRowsToContents()
         layout.addWidget(table, 1)
@@ -208,7 +217,7 @@ class BatchApproval(QDialog):
                 True,
             )
         )
-        self.acknowledge = QCheckBox("已核对重复明细和自转账，仍按清单分别付款")
+        self.acknowledge = QCheckBox("已核对上述地址提醒，仍按清单分别付款")
         if preview["warnings"]:
             warnings = QPlainTextEdit("\n".join(preview["warnings"]))
             warnings.setReadOnly(True)
@@ -230,6 +239,7 @@ class BatchApproval(QDialog):
 
 class BatchPage(QWidget):
     history_changed = Signal()
+    collection_progress_ready = Signal(int, int, int)
 
     def __init__(self, window):
         super().__init__(window)
@@ -241,8 +251,12 @@ class BatchPage(QWidget):
         self.generation = None
         self.busy = False
         self.previewing = False
+        self.calculating = False
+        self.collection_serial = 0
+        self.collection_stop = None
         self.dialog = None
         self._build()
+        self.collection_progress_ready.connect(self._collection_progress)
         self.refresh_wallets()
         self.reload_history()
         self.timer = QTimer(self)
@@ -368,6 +382,41 @@ class BatchPage(QWidget):
         for column in range(3):
             self.common_grid.setColumnStretch(column, 1)
         form.addWidget(self.common_fields)
+        self.collection_tools = QWidget()
+        collection_layout = box(self.collection_tools, spacing=6)
+        self.collect_balance_button = QPushButton("按余额归集")
+        self.collect_balance_button.setToolTip(
+            "按当前清单计算全部钱包的可转数量并填入清单，不会发送交易。"
+        )
+        self.collect_balance_button.clicked.connect(self.calculate_collection)
+        self.extra_reserve = QLineEdit("0")
+        self.extra_reserve.setMaximumWidth(160)
+        self.extra_reserve.setMaxLength(100)
+        self.extra_reserve.setAccessibleName("每钱包额外预留原生币数量")
+        self.extra_reserve.setToolTip(
+            "每个钱包在执行手续费预留之外保留的原生币，供数据费或其他用途。"
+        )
+        self.extra_reserve_label = text("", "fieldLabel")
+        self.extra_reserve_label.setBuddy(self.extra_reserve)
+        self.collection_stop_button = QPushButton("停止计算")
+        self.collection_stop_button.clicked.connect(self.cancel_collection)
+        self.collection_stop_button.hide()
+        collection_layout.addWidget(
+            row(
+                self.collect_balance_button,
+                self.extra_reserve_label,
+                self.extra_reserve,
+                self.collection_stop_button,
+                None,
+            )
+        )
+        self.collection_hint = text("", "muted", True)
+        collection_layout.addWidget(self.collection_hint)
+        self.collection_progress = QProgressBar()
+        self.collection_progress.setFormat("计算进度：%v / %m 个钱包（%p%）")
+        self.collection_progress.hide()
+        collection_layout.addWidget(self.collection_progress)
+        form.addWidget(self.collection_tools)
         add = QPushButton("添加一行")
         add.clicked.connect(lambda: self.add_row())
         self.pick = QPushButton("选择发送钱包")
@@ -378,13 +427,12 @@ class BatchPage(QWidget):
         remove.clicked.connect(self.remove_rows)
         load = QPushButton("导入 CSV")
         load.clicked.connect(self.import_csv)
-        paste = QPushButton("粘贴表格")
-        paste.clicked.connect(self.paste)
         template = QPushButton("下载 CSV 模板")
         template.clicked.connect(self.template)
         actions = QWidget()
+        self.editor_actions = actions
         action_layout = box(actions, horizontal=True, spacing=8)
-        for control in (add, self.pick, remove, load, paste, template):
+        for control in (add, self.pick, remove, load, template):
             control.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             action_layout.addWidget(control)
         action_layout.addStretch()
@@ -401,6 +449,10 @@ class BatchPage(QWidget):
         self.table.itemChanged.connect(self.invalidate)
         form.addWidget(self.table, 1)
         self.feedback = text("清单只包含公开地址和数量，请勿导入私钥。", "fieldLabel", True)
+        self.warn_external = QCheckBox("提醒非本地收款地址")
+        self.warn_external.setToolTip("收款地址不在已解锁的钱包库时提醒；不代表该地址不可用。")
+        self.warn_external.toggled.connect(self.invalidate)
+        form.addWidget(self.warn_external)
         form.addWidget(self.feedback)
         self.preview_button = QPushButton("下一步：预览并校验")
         self.preview_button.setObjectName("primary")
@@ -450,8 +502,11 @@ class BatchPage(QWidget):
         self.sender.currentIndexChanged.connect(self.sync_common)
         self.recipient.textChanged.connect(self.sync_common)
         self.network.currentIndexChanged.connect(self.assets_changed)
+        self.network.currentIndexChanged.connect(self._collection_network_changed)
         self.asset.currentIndexChanged.connect(self.invalidate)
+        self.extra_reserve.textChanged.connect(self.invalidate)
         self.assets_changed()
+        self._collection_network_changed()
         self.mode_changed()
 
     def wallets(self):
@@ -492,6 +547,8 @@ class BatchPage(QWidget):
         self.sender.blockSignals(False)
         self.sender.setEnabled(bool(wallets))
         if not wallets:
+            if self.calculating:
+                self.cancel_collection()
             if self.dialog is not None:
                 self.dialog.reject()
             if self.executing_id:
@@ -508,12 +565,15 @@ class BatchPage(QWidget):
         self.invalidate()
 
     def mode_changed(self):
+        if self.calculating:
+            self.cancel_collection()
         # Rows belong to one mode; reinterpreting them can change the payment intent.
         cleared = self.table.rowCount() > 0
         self.table.setRowCount(0)
         mode = self.mode.currentData()
         self.common_sender.setVisible(mode == "distribute")
         self.common_recipient.setVisible(mode == "collect")
+        self.collection_tools.setVisible(mode == "collect")
         self.pick.setText("选择收款钱包" if mode == "distribute" else "选择发送钱包")
         self.common_grid.removeWidget(self.quantity_fields)
         self.common_grid.addWidget(
@@ -547,9 +607,10 @@ class BatchPage(QWidget):
     def invalidate(self, *_):
         if not hasattr(self, "table"):
             return
+        reviews = self.address_reviews(self.raw_items())
         self.table.blockSignals(True)
         for index in range(self.table.rowCount()):
-            self.table.item(index, 4).setText("待校验")
+            self.set_address_result(index, reviews[index])
             for column in range(1, 5):
                 cell = self.table.item(index, column)
                 cell.setToolTip(cell.text())
@@ -558,6 +619,32 @@ class BatchPage(QWidget):
             f"共 {self.table.rowCount()} 笔。转账包含全部明细，勾选仅用于删除；修改后请重新预览。"
         )
         self.update_checks()
+
+    def address_reviews(self, entries):
+        try:
+            wallets = self.wallets()
+        except UserError:
+            wallets = []
+        return review_addresses(
+            entries,
+            self.mode.currentData(),
+            wallets,
+            warn_external=self.warn_external.isChecked(),
+        )
+
+    def set_address_result(self, index, review, *, error="", validated=False):
+        cell = self.table.item(index, 4)
+        errors = ([error] if error else []) + review["errors"]
+        messages = errors + review["warnings"] + review["info"]
+        prefix = "校验通过" if validated and not errors else "待预览校验" if not errors else ""
+        cell.setText("；".join(([prefix] if prefix else []) + messages))
+        cell.setToolTip(cell.text())
+        cell.setForeground(
+            QColor("#A52C28" if errors else "#815409" if review["warnings"] else "#263C32")
+        )
+        cell.setBackground(
+            QColor("#FDEDEC" if errors else "#FFF5DE" if review["warnings"] else "#FFFFFF")
+        )
 
     def row_checkbox(self, index):
         return self.table.cellWidget(index, 0).findChild(QCheckBox)
@@ -600,7 +687,9 @@ class BatchPage(QWidget):
             self.window.notify("每批最多 100 笔。")
             return
         entry = entry or {
-            "sender": self.sender.currentData() or "",
+            "sender": (self.sender.currentData() or "")
+            if self.mode.currentData() == "distribute"
+            else "",
             "recipient": self.recipient.text().strip()
             if self.mode.currentData() == "collect"
             else "",
@@ -640,10 +729,173 @@ class BatchPage(QWidget):
         self.table.blockSignals(False)
         self.invalidate()
 
+    def _collection_network_changed(self, *_):
+        if self.calculating:
+            self.cancel_collection()
+        info = NETWORKS[self.network.currentData()]
+        self.extra_reserve_label.setText(f"每钱包额外预留（{info.symbol}）")
+        self.extra_reserve.setText("0")
+        self.collection_hint.setText(
+            "默认手动填写；按余额归集计算全部行。原生币扣除费用预留，代币按全部余额计算；修改预留后请重算。"
+            + (
+                " 此网络另收数据费，请填写额外原生币预留。"
+                if info.name in {"base", "xlayer"}
+                else ""
+            )
+        )
+
+    def _collection_context(self):
+        return (
+            self.mode.currentData(),
+            self.network.currentData(),
+            self.asset.currentData(),
+            self.raw_items(),
+            self.extra_reserve.text().strip(),
+        )
+
+    def _set_calculating(self, active):
+        self.calculating = active
+        self.set_previewing(active)
+        for control in (
+            self.settings_panel,
+            self.common_fields,
+            self.table,
+            self.editor_actions,
+            self.preview_button,
+            self.extra_reserve,
+        ):
+            control.setEnabled(not active)
+        self.collect_balance_button.setEnabled(not active)
+        self.collect_balance_button.setText("正在计算…" if active else "按余额归集")
+        self.collection_stop_button.setVisible(active)
+        self.collection_progress.setVisible(active)
+
+    def calculate_collection(self):
+        if self.mode.currentData() != "collect":
+            return
+        if (
+            self.previewing
+            or self.busy
+            or self.executing_id
+            or self.window.busy
+            or self.window.wallet_page.busy
+        ):
+            self.window.notify("请先完成预览或暂停正在执行的转账任务。")
+            return
+        try:
+            wallets = [wallet["address"] for wallet in self.wallets()]
+            generation = self.window.wallet_page.vault.session_generation
+            context = self._collection_context()
+            _, network, asset, items, extra_reserve = context
+            if not items:
+                raise UserError("请先选择或添加发送钱包，并填写统一收款地址。")
+        except UserError as error:
+            self.feedback.setText(friendly_error(error))
+            return
+        self.collection_serial += 1
+        serial = self.collection_serial
+        self.collection_stop = Event()
+        self._set_calculating(True)
+        self.collection_progress.setRange(0, len(items))
+        self.collection_progress.setValue(0)
+        self.feedback.setText("正在读取余额、预估手续费并计算可转数量；尚未发送交易…")
+
+        def completed(result):
+            if serial != self.collection_serial:
+                return
+            self._set_calculating(False)
+            vault = self.window.wallet_page.vault
+            if (
+                self.window.closing
+                or not vault.unlocked
+                or vault.session_generation != generation
+                or context != self._collection_context()
+            ):
+                self.feedback.setText("钱包或清单已变化，本次计算未填入，请重新计算。")
+                return
+            self.table.blockSignals(True)
+            for index, entry in enumerate(result["rows"]):
+                # Failed rows stay in the list with no amount; never silently omit a wallet.
+                self.table.item(index, 3).setText(entry["amount"])
+                self.table.item(index, 3).setToolTip(entry["amount"])
+            reviews = self.address_reviews(self.raw_items())
+            for index, entry in enumerate(result["rows"]):
+                self.set_address_result(index, reviews[index], error=entry["error"])
+                status = self.table.item(index, 4)
+                status.setToolTip(
+                    status.text()
+                    + "\n"
+                    + (
+                        entry["error"]
+                        or (
+                            f"计算时余额：{entry['balance']} {asset.symbol}\n"
+                            f"执行手续费预留：{entry['fee_reserve']} {NETWORKS[network].symbol}\n"
+                            f"额外预留：{entry['extra_reserve']} {NETWORKS[network].symbol}"
+                        )
+                    )
+                )
+            self.table.blockSignals(False)
+            failed = len(result["errors"])
+            self.feedback.setText(
+                f"已计算 {len(items) - failed} / {len(items)} 个钱包。"
+                + (
+                    f"{failed} 行未完成，数量已清空，请处理后重新计算或手动填写。"
+                    if failed
+                    else "数量已填入，可手动修改；余额或费用变化后请重新计算。"
+                )
+                + "核对后仍需预览确认才会发送。"
+            )
+
+        def failed(error):
+            if serial != self.collection_serial:
+                return
+            self._set_calculating(False)
+            self.feedback.setText(friendly_error(error) + " 清单数量未修改。")
+
+        self.window._task(
+            self.service.calculate_collection,
+            (
+                network,
+                asset,
+                items,
+                wallets,
+                extra_reserve,
+                self.collection_stop,
+                lambda done, total: self.collection_progress_ready.emit(serial, done, total),
+            ),
+            completed,
+            failed,
+        )
+
+    def _collection_progress(self, serial, done, total):
+        if self.calculating and serial == self.collection_serial:
+            self.collection_progress.setRange(0, total)
+            self.collection_progress.setValue(done)
+
+    def cancel_collection(self):
+        if not self.calculating:
+            return
+        self.collection_stop.set()
+        self.collection_serial += 1
+        self._set_calculating(False)
+        self.feedback.setText("计算已停止，清单数量未修改。")
+
     def pick_wallets(self):
+        if self.table.rowCount() >= MAX_BATCH_ROWS:
+            self.window.notify("每批最多 100 笔，请先删除部分明细。")
+            return
         try:
             mode = self.mode.currentData()
-            self.dialog = WalletPicker(self.wallets(), self, title=self.pick.text())
+            from .balance_dialog import WalletBalanceDialog
+
+            self.dialog = WalletBalanceDialog(
+                self.wallets(),
+                self.window,
+                parent=self,
+                title=self.pick.text(),
+                network=self.network.currentData(),
+                selection_limit=MAX_BATCH_ROWS - self.table.rowCount(),
+            )
             if self.dialog.exec() == QDialog.DialogCode.Accepted:
                 for address in self.dialog.selected():
                     self.add_row(
@@ -665,22 +917,6 @@ class BatchPage(QWidget):
             if self.dialog:
                 self.dialog.deleteLater()
                 self.dialog = None
-
-    def use_wallets(self, senders):
-        if self.previewing:
-            return
-        self.history.setCurrentIndex(-1)
-        self.mode.setCurrentIndex(self.mode.findData("collect"))
-        self.table.setRowCount(0)
-        self.invalidate()
-        for sender in senders:
-            self.add_row(
-                {
-                    "sender": sender,
-                    "recipient": self.recipient.text().strip(),
-                    "amount": self.amount.text().strip(),
-                }
-            )
 
     def load_content(self, content):
         entries = parse_manifest(
@@ -715,28 +951,6 @@ class BatchPage(QWidget):
         except UserError as error:
             self.window._show_error(error)
 
-    def paste(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("粘贴公开地址和数量")
-        dialog.resize(700, 360)
-        layout = box(dialog, margins=(20, 20, 20, 20))
-        editor = QPlainTextEdit()
-        editor.setPlaceholderText("sender,recipient,amount\n或直接粘贴 Excel 表格；不接受私钥")
-        editor.setPlainText(QApplication.clipboard().text()[: MAX_BATCH_BYTES + 1])
-        layout.addWidget(editor)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            try:
-                self.load_content(editor.toPlainText())
-            except UserError as error:
-                self.window._show_error(error)
-        dialog.deleteLater()
-
     def template(self):
         filename, _ = QFileDialog.getSaveFileName(
             self, "保存清单模板", "batch-template.csv", "CSV (*.csv)"
@@ -757,8 +971,13 @@ class BatchPage(QWidget):
         ]
 
     def preview(self):
-        if (self.previewing or self.busy or self.executing_id or self.window.busy
-                or self.window.wallet_page.busy):
+        if (
+            self.previewing
+            or self.busy
+            or self.executing_id
+            or self.window.busy
+            or self.window.wallet_page.busy
+        ):
             self.window.notify("请先暂停正在执行的批次。")
             return
         try:
@@ -781,10 +1000,15 @@ class BatchPage(QWidget):
         def completed(preview):
             self.set_previewing(False)
             self.views.widget(0).setEnabled(True)
+            reviews = self.address_reviews(self.raw_items())
             self.table.blockSignals(True)
             for index in range(self.table.rowCount()):
-                self.table.item(index, 4).setText(preview["errors"].get(index + 1, "校验通过"))
-                self.table.item(index, 4).setToolTip(self.table.item(index, 4).text())
+                self.set_address_result(
+                    index,
+                    reviews[index],
+                    error=preview["errors"].get(index + 1, ""),
+                    validated=True,
+                )
             self.table.blockSignals(False)
             if preview["errors"]:
                 self.feedback.setText(
@@ -814,6 +1038,17 @@ class BatchPage(QWidget):
         if not vault.unlocked or vault.session_generation != generation:
             self.window.notify("钱包库状态已变化，请重新预览。")
             return False
+        # Recheck local names and the optional reminder using the exact approved items,
+        # including when resuming a historical batch with a different editor mode.
+        reviews = review_addresses(
+            preview["items"],
+            preview["mode"],
+            vault.wallets(),
+            warn_external=self.warn_external.isChecked(),
+        )
+        preview = dict(preview)
+        preview["address_reviews"] = reviews
+        preview["warnings"] = list(dict.fromkeys(preview["warnings"] + review_warnings(reviews)))
         self.dialog = BatchApproval(preview, self)
         try:
             accepted = self.dialog.exec() == QDialog.DialogCode.Accepted
@@ -1170,6 +1405,7 @@ class BatchPage(QWidget):
             self.window._show_error(error)
 
     def shutdown(self):
+        self.cancel_collection()
         self.timer.stop()
         if self.executing_id:
             self.service.pause(self.executing_id, "应用退出，核对结果后可手动继续。")

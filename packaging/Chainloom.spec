@@ -44,6 +44,8 @@ app = BUNDLE(
     icon=str(assets / "icon.icns"),
     bundle_identifier="app.chainloom.desktop",
     info_plist={
+        "CFBundleName": "Chainloom",
+        "CFBundleDisplayName": "Chainloom",
         "CFBundleShortVersionString": "0.1.0",
         "CFBundleVersion": "1",
         "NSHighResolutionCapable": True,

@@ -12,16 +12,16 @@ from web3.exceptions import TransactionNotFound
 from ..diagnostics import LOGGER, record_exception, record_operation
 from ..errors import UserError
 from ..storage import Store
-from ..transfer import ERC20_ABI, PreparedTransfer, TransferRequest, TransferService, address
+from ..transfer import (
+    ERC20_ABI,
+    PreparedTransfer,
+    TransferRequest,
+    TransferService,
+    address,
+    format_units,
+)
 from .rpc import OperationCancelled, check_cancelled, connect_desktop
 from .settings import HISTORY_NETWORKS, NETWORKS, Asset, Preferences
-
-
-def format_units(units: int, decimals: int = 18) -> str:
-    if not decimals:
-        return str(units)
-    value = str(units).rjust(decimals + 1, "0")
-    return (value[:-decimals] + "." + value[-decimals:]).rstrip("0").rstrip(".")
 
 
 def friendly_error(error: Exception) -> str:
@@ -130,6 +130,66 @@ class DesktopService:
             "native": format_units(native),
             "decimals": decimals,
         }
+
+    def bulk_balances(
+        self, name, senders, assets, cancelled, progress=None, *, include_native=True
+    ):
+        """Read public balances at one block; failures never masquerade as zero."""
+        if name not in NETWORKS or not 1 <= len(senders) <= 1000:
+            raise UserError("请选择网络及 1–1000 个钱包进行查询。")
+
+        def check():
+            check_cancelled(self.cancelled)
+            check_cancelled(cancelled)
+
+        check()
+        senders = list(dict.fromkeys(address(sender) for sender in senders))
+        web3, _ = self.web3(name)
+        block = web3.eth.block_number
+        tokens = {}
+        for asset in assets:
+            if not asset.contract or asset.contract in tokens:
+                continue
+            check()
+            try:
+                token = web3.eth.contract(address=address(asset.contract), abi=ERC20_ABI)
+                decimals = token.functions.decimals().call(block_identifier=block)
+                if type(decimals) is not int or not 0 <= decimals <= 255:
+                    raise UserError("代币精度不正确。")
+                tokens[asset.contract] = (token, decimals)
+            except OperationCancelled:
+                raise
+            except Exception as error:  # noqa: BLE001 - retain native/other token results
+                record_exception("批量余额查询：读取代币精度", error)
+                tokens[asset.contract] = None
+        results = []
+        for sender in senders:
+            check()
+            balances, errors = {}, {}
+            for contract in ((None,) if include_native else ()) + tuple(tokens):
+                check()
+                try:
+                    if contract is None:
+                        units = web3.eth.get_balance(sender, block)
+                        decimals = 18
+                    elif tokens[contract] is None:
+                        errors[contract] = "无法读取代币精度，请检查合约及节点。"
+                        continue
+                    else:
+                        token, decimals = tokens[contract]
+                        units = token.functions.balanceOf(sender).call(block_identifier=block)
+                    balances[contract] = format_units(units, decimals)
+                except OperationCancelled:
+                    raise
+                except Exception as error:  # noqa: BLE001 - each cell can fail independently
+                    record_exception("批量余额查询：读取钱包余额", error)
+                    errors[contract] = "查询失败，请检查网络节点或代币合约后重试。"
+            check()
+            result = {"address": sender, "balances": balances, "errors": errors, "block": block}
+            results.append(result)
+            if progress:
+                progress(result)
+        return results
 
     def inspect_token(self, name, symbol, contract):
         asset = Asset(symbol, address(contract))

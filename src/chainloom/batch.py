@@ -42,16 +42,14 @@ def parse_manifest(content, mode="mapping", sender="", recipient=""):
     if len(content.encode("utf-8")) > MAX_BATCH_BYTES:
         raise UserError("清单最多 1 MB。")
     content = content.lstrip("\ufeff")
-    first_line = content.splitlines()[0] if content.splitlines() else ""
-    delimiter = "\t" if "\t" in first_line else ","
     try:
         records = [
             row
-            for row in csv.reader(io.StringIO(content), delimiter=delimiter, strict=True)
+            for row in csv.reader(io.StringIO(content), strict=True)
             if any(cell.strip() for cell in row)
         ]
     except csv.Error:
-        raise UserError("清单格式不正确，请使用 CSV 或从表格复制。") from None
+        raise UserError("清单格式不正确，请使用 CSV。") from None
     if not records:
         raise UserError("请先填写转账清单。")
     aliases = {

@@ -51,6 +51,23 @@ QTableWidget#historyTable::item { padding: 10px 4px; }
 QTableWidget::item:selected { background: #E4EDDF; color: #263C32; }
 QHeaderView::section { background: #F2F5EE; border: none; padding: 12px; color: #71816F; }
 QDialog { background: #FCFDF9; }
+QTabWidget#walletTabs::pane { border: none; background: #FDFEFC; }
+QTabWidget#walletTabs QTabBar::tab {
+    background: transparent; color: #71816F; padding: 11px 22px;
+    border: none; border-bottom: 2px solid #E5EAE1;
+}
+QTabWidget#walletTabs QTabBar::tab:selected {
+    color: #226B53; font-weight: 600; border-bottom: 2px solid #226B53;
+}
+QTabWidget#walletTabs QTabBar::tab:hover { background: #F3F6F0; }
+QWidget#walletBalancePage QPushButton {
+    font-size: 12px; padding: 7px 11px; min-height: 20px;
+}
+QWidget#walletBalancePage QPushButton#primary { min-height: 22px; }
+QWidget#walletBalancePage QComboBox, QWidget#walletBalancePage QLineEdit,
+QWidget#walletSearch QComboBox, QWidget#walletSearch QLineEdit {
+    padding: 7px 10px; min-height: 20px;
+}
 QScrollArea { border: none; background: transparent; }
 QScrollBar:vertical { width: 8px; background: transparent; }
 QScrollBar::handle:vertical { background: #D1DCCB; border-radius: 4px; min-height: 30px; }

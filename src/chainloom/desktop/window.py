@@ -60,6 +60,7 @@ HISTORY_COPY_FIELDS = {5: "发送地址", 6: "收款地址", 7: "交易哈希"}
 class MainWindow(QMainWindow):
     task_succeeded = Signal(str, object)
     task_failed = Signal(str, object)
+    assets_changed = Signal(str)
 
     def __init__(self, directory: Path, preferences: Preferences, backend=None):
         super().__init__()
@@ -90,6 +91,7 @@ class MainWindow(QMainWindow):
         self.task_failed.connect(self._task_failure)
         self._build()
         self.copy_toast = CopyToast(self)
+        self.wallet_page.address_copied.connect(lambda: self._notify_copied("钱包地址"))
         self.wallet_page.state_changed.connect(self._local_wallet_changed)
         self.balance_timer = QTimer(self)
         self.balance_timer.setSingleShot(True)
@@ -140,7 +142,6 @@ class MainWindow(QMainWindow):
         self.batch_page = BatchPage(self)
         self.stack.addWidget(self.batch_page)
         self.batch_page.history_changed.connect(self.load_history)
-        self.wallet_page.batch_requested.connect(self._batch_from_wallets)
         self.stack.setCurrentIndex(3)
         root_box.addWidget(self.stack, 1)
         self.setCentralWidget(root)
@@ -437,9 +438,12 @@ class MainWindow(QMainWindow):
             self.batch_page.refresh_wallets()
             self.batch_page.reload_history()
 
-    def _batch_from_wallets(self, addresses):
-        self.navigate(4)
-        self.batch_page.use_wallets(addresses)
+    def _open_wallet_balances(self):
+        if not self.wallet_page.vault.unlocked or self.wallet_page.busy:
+            self.notify("请先解锁钱包库，并等待当前钱包库操作完成。")
+            return
+        self.navigate(3)
+        self.wallet_page.tabs.setCurrentIndex(1)
 
     def _task(self, function, args=(), success=None, failure=None):
         import uuid
@@ -476,7 +480,7 @@ class MainWindow(QMainWindow):
 
     def notify(self, message):
         self.wallet_page.notify(message)
-        self.statusBar().showMessage(message, 2000)
+        self.statusBar().showMessage(message)
 
     def network_name(self):
         return self.network.currentData()
@@ -813,7 +817,7 @@ class MainWindow(QMainWindow):
 
     def _copy_history_value(self, value, label):
         if not value:
-            self.statusBar().showMessage("暂无可复制的" + label, 2000)
+            self.statusBar().showMessage("暂无可复制的" + label)
             return
         QApplication.clipboard().setText(value)
         self._notify_copied(label)
@@ -1091,24 +1095,26 @@ class MainWindow(QMainWindow):
         self._edited()
         self.balance_timer.start()
 
-    def _add_token(self):
+    def _add_token(self, checked=False, *, network=None, parent=None):
         if self.busy or self.batch_page.running or self.batch_page.previewing:
             self.notify("请先完成预览或暂停转账任务，再添加代币。")
             return
-        dialog = TokenDialog(self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
+        name = network or self.network_name()
+        dialog = TokenDialog(parent or self)
         try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
             symbol, contract = dialog.symbol.text().strip(), dialog.contract.text().strip()
             temporary = replace(
                 self.preferences,
-                custom_assets={self.network_name(): [asdict(Asset(symbol, contract))]},
+                custom_assets={name: [asdict(Asset(symbol, contract))]},
             )
             temporary.validate()
         except ValueError as error:
             self._show_error(error)
             return
-        name = self.network_name()
+        finally:
+            dialog.deleteLater()
 
         def added(asset):
             custom = {key: list(value) for key, value in self.preferences.custom_assets.items()}
@@ -1120,17 +1126,19 @@ class MainWindow(QMainWindow):
                 self.notify("此代币已在资产列表中。")
                 return
             custom.setdefault(name, []).append(asdict(asset))
-            self.preferences = replace(self.preferences, custom_assets=custom)
+            preferences = replace(self.preferences, custom_assets=custom)
             try:
-                save_preferences(self.directory, self.preferences)
+                save_preferences(self.directory, preferences)
             except OSError as error:
                 self._show_error(error)
                 return
+            self.preferences = preferences
             self.backend = DesktopService(
                 self.directory, self.preferences, cancelled=self.stop_event
             )
             self.batch_page.service.backend = self.backend
             self.batch_page.assets_changed()
+            self.assets_changed.emit(name)
             if name == self.network_name():
                 self._network_changed()
                 self.asset.setCurrentIndex(self.asset.count() - 1)

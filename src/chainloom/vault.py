@@ -221,8 +221,8 @@ class WalletVault:
     def create(self, password: str, cancelled: Event | None = None):
         if cancelled is not None and cancelled.is_set():
             raise ImportCancelled()
-        if not 12 <= len(password) <= 256:
-            raise UserError("钱包库密码请使用 12–256 个字符。请妥善保存，遗忘后无法恢复。")
+        if not 8 <= len(password) <= 256:
+            raise UserError("钱包库密码请使用 8–256 个字符。请妥善保存，遗忘后无法恢复。")
         with self._mutex:
             if self.exists:
                 raise UserError("钱包库已存在，不能覆盖，请使用解锁功能。")
@@ -319,8 +319,8 @@ class WalletVault:
             if generation is not None and generation != self._generation:
                 raise VaultLocked()
 
-        if not 12 <= len(new_password) <= 256:
-            raise UserError("钱包库密码请使用 12–256 个字符。")
+        if not 8 <= len(new_password) <= 256:
+            raise UserError("钱包库密码请使用 8–256 个字符。")
         if current_password == new_password:
             raise UserError("新密码不能与当前密码相同。")
         with self._mutex, self._connection() as connection:

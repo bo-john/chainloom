@@ -1,5 +1,7 @@
 """Sequential batch execution with persistent identities and bounded fee approval."""
 
+import re
+from collections import Counter
 from dataclasses import asdict
 from threading import Event, Lock
 
@@ -10,6 +12,7 @@ from ..batch import MAX_BATCH_ROWS, MODES, batch_store
 from ..diagnostics import record_exception, record_operation
 from ..errors import UserError
 from ..transfer import ERC20_ABI, TransferRequest, address, amount_units
+from .address_review import review_addresses, review_warnings
 from .rpc import OperationCancelled, check_cancelled
 from .service import VaultSigner, format_units, friendly_error
 from .settings import NETWORKS, Asset
@@ -59,24 +62,99 @@ class BatchService:
         with batch_store(self.directory) as store:
             return store.get(batch_id)
 
+    def calculate_collection(
+        self, network, asset, items, wallets, extra_reserve="0", cancelled=None, progress=None
+    ):
+        """Fill explicit collection amounts without creating a batch or sending funds."""
+        if network not in NETWORKS or not 1 <= len(items) <= MAX_BATCH_ROWS:
+            raise UserError(f"请选择网络及 1–{MAX_BATCH_ROWS} 个发送钱包。")
+        if len(extra_reserve) > 100 or not re.fullmatch(r"[0-9]+(?:\.[0-9]{1,18})?", extra_reserve):
+            raise UserError("额外预留请输入最多 18 位小数的非负原生币数量。")
+        reserve = (
+            amount_units(extra_reserve, 18)
+            if any(char in "123456789" for char in extra_reserve)
+            else 0
+        )
+        if network in {"base", "xlayer"} and reserve == 0:
+            raise UserError("此网络另收数据费，请设置每钱包的额外原生币预留后再按余额归集。")
+        recipients = {address(item["recipient"].strip()) for item in items}
+        if len(recipients) != 1:
+            raise UserError("多对一归集必须使用同一个收款地址。")
+        allowed = {address(wallet).lower() for wallet in wallets}
+        counts = Counter()
+        for item in items:
+            try:
+                counts[address(item["sender"].strip()).lower()] += 1
+            except UserError:
+                # Invalid senders receive their own row error below.
+                continue
+        stop = StopSignal(self.backend.cancelled, cancelled or Event())
+        check_cancelled(stop)
+        result = {"rows": [], "errors": {}}
+        with self.backend.service(network) as service:
+            for index, raw in enumerate(items, 1):
+                check_cancelled(stop)
+                row = {
+                    "position": index,
+                    "sender": raw["sender"],
+                    "recipient": raw["recipient"],
+                    "amount": "",
+                    "fee_reserve": "",
+                    "balance": "",
+                    "error": "",
+                    "extra_reserve": format_units(reserve),
+                }
+                try:
+                    sender = address(raw["sender"].strip())
+                    if sender.lower() not in allowed:
+                        raise UserError("发送钱包不在已解锁的本地钱包库中。")
+                    if counts[sender.lower()] > 1:
+                        raise UserError("同一钱包重复出现，按余额归集时每个发送钱包只能保留一行。")
+                    if service.store.active(service.network.chain_id, sender):
+                        raise UserError("此钱包有待确认交易，请先到交易记录中处理。")
+                    prepared = service.prepare_collection(
+                        sender, next(iter(recipients)), asset.contract, reserve
+                    )
+                    row.update(
+                        amount=prepared.request.amount,
+                        fee_reserve=format_units(int(prepared.preview["max_execution_fee_wei"])),
+                        balance=format_units(
+                            int(prepared.preview["collection"]["balance_units"]),
+                            prepared.preview["decimals"],
+                        ),
+                    )
+                except OperationCancelled:
+                    raise
+                except Exception as error:  # noqa: BLE001 - retain every row, including failures
+                    record_exception("按余额计算归集数量", error)
+                    row["error"] = friendly_error(error)
+                    result["errors"][index] = row["error"]
+                check_cancelled(stop)
+                result["rows"].append(row)
+                if progress:
+                    progress(index, len(items))
+        return result
+
     def preview(self, mode, network, asset, items, wallets):
         if mode not in MODES or network not in NETWORKS:
             raise UserError("批量模式或网络不受支持。")
         if not 1 <= len(items) <= MAX_BATCH_ROWS:
             raise UserError(f"每批需要 1–{MAX_BATCH_ROWS} 笔转账。")
         allowed = {address(wallet).lower() for wallet in wallets}
+        reviews = review_addresses(items, mode, wallets)
         result = {
             "mode": mode,
             "network": network,
             "asset": asdict(asset),
             "items": [],
             "errors": {},
-            "warnings": [],
+            "warnings": review_warnings(reviews),
+            "address_reviews": reviews,
             "senders": [],
             "total": "0",
             "fee_total": "0",
         }
-        totals, seen = {}, {}
+        totals = {}
         with self.backend.service(network) as service:
             decimals, _ = service._asset(TransferRequest("", "", "1", asset.contract))
             for index, raw in enumerate(items, 1):
@@ -110,14 +188,6 @@ class BatchService:
                     group["amount"] += units
                     group["fee"] += fee
                     group["positions"].append(index)
-                    key = request.intent(service.network.chain_id)
-                    if key in seen:
-                        result["warnings"].append(
-                            f"第 {index} 行与第 {seen[key]} 行完全重复，将分别付款。"
-                        )
-                    seen[key] = index
-                    if request.sender == request.recipient:
-                        result["warnings"].append(f"第 {index} 行为向自己转账。")
                 except OperationCancelled:
                     raise
                 except Exception as error:  # noqa: BLE001 - report each invalid row without RPC data

@@ -1,11 +1,11 @@
 """Render a visual concept with actual PySide6 widgets; all data is illustrative.
 
 Run: QT_QPA_PLATFORM=offscreen uv run --no-project --with 'PySide6-Essentials==6.10.2' python \
-     output/previews/render_macos_preview.py
+     scripts/render_macos_preview.py output/previews/preview.png
 """
 
+import argparse
 import os
-import sys
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -261,7 +261,11 @@ def build():
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
+    parser = argparse.ArgumentParser(description="Render a macOS interface concept to a PNG file.")
+    parser.add_argument("output", type=Path, help="PNG output path; no default file is generated")
+    args = parser.parse_args()
+    destination = args.output.expanduser().resolve()
+    app = QApplication([])
     app.setFont(QFont("PingFang SC", 12))
     canvas = build()
     canvas.show()
@@ -270,7 +274,7 @@ if __name__ == "__main__":
     image.setDevicePixelRatio(2)
     image.fill(QColor("#E8EDE8"))
     canvas.render(image)
-    destination = Path(__file__).with_name("chainloom-macos-preview.png")
+    destination.parent.mkdir(parents=True, exist_ok=True)
     if not image.save(str(destination)):
         raise RuntimeError("Could not save preview")
     print(destination.resolve())

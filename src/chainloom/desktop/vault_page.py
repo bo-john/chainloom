@@ -13,12 +13,14 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QInputDialog,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QWidget,
 )
 
@@ -48,7 +50,7 @@ class VaultPasswordDialog(QDialog):
         self.password = QLineEdit()
         self.password.setEchoMode(QLineEdit.EchoMode.Password)
         self.password.setMaxLength(256)
-        self.password.setPlaceholderText("至少 12 个字符" if creating else "钱包库密码")
+        self.password.setPlaceholderText("至少 8 个字符" if creating else "钱包库密码")
         layout.addWidget(self.password)
         self.repeat = QLineEdit()
         self.repeat.setEchoMode(QLineEdit.EchoMode.Password)
@@ -65,8 +67,8 @@ class VaultPasswordDialog(QDialog):
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
 
         def accept():
-            if creating and not 12 <= len(self.password.text()) <= 256:
-                self.error.setText("密码请使用 12–256 个字符。")
+            if creating and not 8 <= len(self.password.text()) <= 256:
+                self.error.setText("密码请使用 8–256 个字符。")
             elif creating and self.password.text() != self.repeat.text():
                 self.error.setText("两次输入的密码不一致。")
             elif not self.password.text():
@@ -96,14 +98,14 @@ class ChangeVaultPasswordDialog(QDialog):
         layout.addWidget(text("修改钱包库密码", "brand"))
         layout.addWidget(text(
             "全部钱包将使用新密码重新加密。修改成功后钱包库会锁定，请使用新密码解锁。"
-            "新密码请使用 12–256 个字符，遗忘后无法恢复。", "muted", True
+            "新密码请使用 8–256 个字符，遗忘后无法恢复。", "muted", True
         ))
         self.current_password = QLineEdit()
         self.new_password = QLineEdit()
         self.repeat = QLineEdit()
         for entry, placeholder in (
             (self.current_password, "当前密码"),
-            (self.new_password, "新密码（至少 12 个字符）"),
+            (self.new_password, "新密码（至少 8 个字符）"),
             (self.repeat, "再次输入新密码"),
         ):
             entry.setEchoMode(QLineEdit.EchoMode.Password)
@@ -125,8 +127,8 @@ class ChangeVaultPasswordDialog(QDialog):
     def accept(self):
         if not self.current_password.text():
             self.error.setText("请输入当前密码。")
-        elif not 12 <= len(self.new_password.text()) <= 256:
-            self.error.setText("新密码请使用 12–256 个字符。")
+        elif not 8 <= len(self.new_password.text()) <= 256:
+            self.error.setText("新密码请使用 8–256 个字符。")
         elif self.new_password.text() != self.repeat.text():
             self.error.setText("两次输入的新密码不一致。")
         elif self.current_password.text() == self.new_password.text():
@@ -290,7 +292,7 @@ class WalletImportDialog(QDialog):
 
 class WalletManagementPage(QWidget):
     state_changed = Signal(str)
-    batch_requested = Signal(list)
+    address_copied = Signal()
     import_progress = Signal(int, int, int)
     AUTO_LOCK_SECONDS = 300
 
@@ -326,25 +328,26 @@ class WalletManagementPage(QWidget):
         self.refresh()
 
     def _build(self):
-        layout = box(self, margins=(32, 30, 32, 26), spacing=15)
+        layout = box(self, margins=(32, 26, 32, 24), spacing=10)
         self.open_button = QPushButton()
         self.open_button.setObjectName("primary")
         self.open_button.clicked.connect(self.open_vault)
         self.lock_button = QPushButton("锁定钱包库")
         self.lock_button.clicked.connect(self.lock)
-        layout.addWidget(row(text("钱包管理", "heading"), None, self.open_button, self.lock_button))
+        self.status = text("", "fieldLabel")
+        layout.addWidget(row(text("钱包管理", "heading"), None, self.status,
+                             self.open_button, self.lock_button))
         self.description = text(
             "在本机加密保存和整理钱包，转账时从钱包库选择发送钱包。", "muted", True
         )
         layout.addWidget(self.description)
-        self.status = text("", "fieldLabel")
-        layout.addWidget(self.status)
         self.progress_bar = QProgressBar()
         self.progress_bar.hide()
         layout.addWidget(self.progress_bar)
         self.locked_hint = text("", "muted", True)
         layout.addWidget(self.locked_hint)
         self.tools = QWidget()
+        self.tools.setObjectName("walletSearch")
         tools = box(self.tools, spacing=12)
         self.search = QLineEdit()
         self.search.setPlaceholderText("搜索钱包名称、完整地址或分组")
@@ -361,24 +364,20 @@ class WalletManagementPage(QWidget):
         self.assign_group_button.clicked.connect(self.assign_group)
         self.rename_button = QPushButton("重命名")
         self.rename_button.clicked.connect(self.rename_wallet)
-        self.copy_button = QPushButton("复制地址")
-        self.copy_button.clicked.connect(self.copy_address)
-        self.batch_button = QPushButton("批量转账")
-        self.batch_button.clicked.connect(
-            lambda: self.batch_requested.emit(self.selected_addresses())
-        )
-        tools.addWidget(
+        layout.addWidget(self.tools)
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("walletTabs")
+        self.wallet_list = QWidget()
+        wallet_layout = box(self.wallet_list, margins=(0, 16, 0, 0), spacing=12)
+        wallet_layout.addWidget(
             row(
                 self.import_button,
                 self.new_group_button,
                 self.assign_group_button,
                 self.rename_button,
-                self.copy_button,
-                self.batch_button,
                 None,
             )
         )
-        layout.addWidget(self.tools)
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(
             ["钱包名称", "钱包地址", "分组", "导入时间（北京时间）"]
@@ -393,9 +392,19 @@ class WalletManagementPage(QWidget):
             1, QHeaderView.ResizeMode.ResizeToContents
         )
         self.table.itemSelectionChanged.connect(self._selection_changed)
-        layout.addWidget(self.table, 1)
+        self.table.cellDoubleClicked.connect(self._copy_wallet_address)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._wallet_context_menu)
+        wallet_layout.addWidget(self.table, 1)
         self.count = text("", "muted")
-        layout.addWidget(self.count)
+        wallet_layout.addWidget(self.count)
+        self.tabs.addTab(self.wallet_list, "钱包列表")
+        from .balance_page import WalletBalancePage
+
+        self.balance_page = WalletBalancePage(self.parent(), self)
+        self.tabs.addTab(self.balance_page, "资产余额")
+        self.tabs.currentChanged.connect(self._tab_changed)
+        layout.addWidget(self.tabs, 1)
         self.security_hint = text(
             "私钥加密保存；名称、地址与分组以明文保存在本机。闲置 5 分钟后自动锁定。",
             "muted",
@@ -439,11 +448,9 @@ class WalletManagementPage(QWidget):
         titles = {"info": "提示", "success": "操作成功", "warning": "请注意", "error": "操作失败"}
         return self._show_notification(titles[severity], message, severity)
 
-    def _show_notification(self, title, message, severity, duration_ms=2000):
+    def _show_notification(self, title, message, severity):
         if self._shutting_down:
             return None
-        if self.notification_dialog is not None:
-            self.notification_dialog.reject()
         icons = {
             "info": QMessageBox.Icon.Information,
             "success": QMessageBox.Icon.Information,
@@ -457,19 +464,14 @@ class WalletManagementPage(QWidget):
         dialog.button(QMessageBox.StandardButton.Ok).setText("关闭")
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.setWindowModality(Qt.WindowModality.NonModal)
-        timer = QTimer(dialog)
-        timer.setSingleShot(True)
-        timer.timeout.connect(dialog.accept)
 
         def finished():
-            timer.stop()
             if self.notification_dialog is dialog:
                 self.notification_dialog = None
 
         dialog.finished.connect(finished)
         self.notification_dialog = dialog
         dialog.show()
-        timer.start(duration_ms)
         return dialog
 
     def refresh(self):
@@ -495,6 +497,8 @@ class WalletManagementPage(QWidget):
         )
         self.tools.setVisible(unlocked)
         self.tools.setEnabled(not self.busy)
+        self.tabs.setVisible(unlocked)
+        self.tabs.setEnabled(not self.busy)
         self.table.setVisible(unlocked)
         self.table.setEnabled(not self.busy)
         self.table.clearSelection()
@@ -517,6 +521,8 @@ class WalletManagementPage(QWidget):
             self.group_filter.blockSignals(False)
             self.filter_wallets()
         else:
+            self.balance_page.clear()
+            self.tabs.setCurrentIndex(0)
             self.rows = []
             self.group_rows = []
             self.table.setRowCount(0)
@@ -527,8 +533,10 @@ class WalletManagementPage(QWidget):
     def filter_wallets(self, *_):
         if not self.vault.unlocked:
             return
+        selected = set(self.selected_addresses())
         try:
             self.rows = self.vault.wallets(self.search.text(), self.group_filter.currentData())
+            all_wallets = self.vault.wallets()
         except (UserError, OSError):
             self.vault.lock()
             self.refresh()
@@ -549,8 +557,29 @@ class WalletManagementPage(QWidget):
                 item.setData(Qt.ItemDataRole.UserRole, wallet["address"])
                 self.table.setItem(index, column, item)
             self.table.setRowHeight(index, 46)
-        self.count.setText(f"当前显示 {len(self.rows)} 个钱包。可多选后统一调整分组。")
+        self.count.setText(
+            f"当前显示 {len(self.rows)} 个钱包。可多选调整分组，双击或右键复制钱包地址。"
+        )
+        self._select_addresses(selected)
+        self.balance_page.set_wallets(all_wallets, [wallet["address"] for wallet in self.rows])
         self._selection_changed()
+
+    def _select_addresses(self, addresses):
+        from PySide6.QtCore import QItemSelectionModel
+
+        self.table.clearSelection()
+        for index, wallet in enumerate(self.rows):
+            if wallet["address"] in addresses:
+                self.table.selectionModel().select(
+                    self.table.model().index(index, 0),
+                    QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+                )
+
+    def _tab_changed(self, index):
+        if index == 1:
+            self.balance_page.set_selected(self.selected_addresses())
+        else:
+            self._select_addresses(set(self.balance_page.selected()))
 
     def selected_addresses(self):
         return [
@@ -562,8 +591,6 @@ class WalletManagementPage(QWidget):
         addresses = self.selected_addresses()
         self.assign_group_button.setEnabled(bool(addresses))
         self.rename_button.setEnabled(len(addresses) == 1)
-        self.copy_button.setEnabled(bool(addresses))
-        self.batch_button.setEnabled(bool(addresses))
 
     def _run(self, operation, success, failure_title=None, success_after_cancel=False):
         self.busy = True
@@ -813,6 +840,27 @@ class WalletManagementPage(QWidget):
                 record_exception("修改钱包名称", error)
                 self.notify(str(error))
 
-    def copy_address(self):
-        QApplication.clipboard().setText("\n".join(self.selected_addresses()))
-        self.notify("已复制所选钱包的公开地址。")
+    def _copy_address_value(self, address):
+        if not self.vault.unlocked or self.busy or not address:
+            return
+        QApplication.clipboard().setText(address)
+        self.address_copied.emit()
+
+    def _copy_wallet_address(self, row, column=0):
+        cell = self.table.item(row, 1)
+        if cell is not None:
+            self._copy_address_value(cell.data(Qt.ItemDataRole.UserRole))
+
+    def _wallet_context_menu(self, position):
+        cell = self.table.itemAt(position)
+        if cell is None or not self.vault.unlocked or self.busy:
+            return
+        address = self.table.item(cell.row(), 1).data(Qt.ItemDataRole.UserRole)
+        if not cell.isSelected():
+            self.table.setCurrentCell(cell.row(), cell.column())
+        menu = QMenu(self.table)
+        action = menu.addAction("复制钱包地址")
+        # Keep the clicked address if the list refreshes while the menu is open.
+        action.triggered.connect(lambda: self._copy_address_value(address))
+        menu.exec(self.table.viewport().mapToGlobal(position))
+        menu.deleteLater()

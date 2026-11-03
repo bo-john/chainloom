@@ -64,6 +64,13 @@ def amount_units(amount: str, decimals: int) -> int:
     return units
 
 
+def format_units(units: int, decimals: int = 18) -> str:
+    if not decimals:
+        return str(units)
+    value = str(units).rjust(decimals + 1, "0")
+    return (value[:-decimals] + "." + value[-decimals:]).rstrip("0").rstrip(".")
+
+
 @dataclass(frozen=True)
 class TransferRequest:
     sender: str
@@ -175,18 +182,92 @@ class TransferService:
         if self.web3.eth.get_balance(request.sender, "pending") <= tx["value"]:
             raise UserError("Insufficient native balance for amount and gas fee")
         block = self.web3.eth.get_block("latest")
+        tx.update(self._fee_fields(block))
+        tx["gas"] = self._gas_limit(tx, block)
+        self._balances_and_simulation(request, tx)
+        return self._prepared(request, tx, decimals, units)
+
+    def _fee_fields(self, block):
         if block.get("baseFeePerGas") is not None:
             priority = self.web3.eth.max_priority_fee
-            tx.update(
-                maxPriorityFeePerGas=priority, maxFeePerGas=2 * block["baseFeePerGas"] + priority
-            )
-        else:
-            tx["gasPrice"] = self.web3.eth.gas_price
-        estimate = self.web3.eth.estimate_gas(tx, block_identifier="pending")
-        tx["gas"] = (estimate * 120 + 99) // 100
-        if tx["gas"] > block["gasLimit"]:
+            return {
+                "maxPriorityFeePerGas": priority,
+                "maxFeePerGas": 2 * block["baseFeePerGas"] + priority,
+            }
+        return {"gasPrice": self.web3.eth.gas_price}
+
+    def _gas_limit(self, tx, block):
+        estimate = self.web3.eth.estimate_gas(
+            {key: value for key, value in tx.items() if key != "gas"}, block_identifier="pending"
+        )
+        limit = (estimate * 120 + 99) // 100
+        if limit > block["gasLimit"]:
             raise UserError("Estimated gas plus margin exceeds block gas limit")
+        return limit
+
+    def prepare_collection(self, sender, recipient, token=None, extra_reserve=0):
+        """Calculate a fixed transferable amount; never sign or broadcast here."""
+        if type(extra_reserve) is not int or not 0 <= extra_reserve < 2**256:
+            raise UserError("额外预留必须是非负的原生币数量。")
+        self.check_chain()
+        request = TransferRequest(sender, recipient, "1", token).normalized()
+        if request.sender == request.recipient:
+            raise UserError("发送钱包与归集地址相同，请从清单中移除此行。")
+        decimals, contract = self._asset(request)
+        native = self.web3.eth.get_balance(request.sender, "pending")
+        available = (
+            contract.functions.balanceOf(request.sender).call(block_identifier="pending")
+            if contract
+            else native
+        )
+        if available <= 0:
+            raise UserError("该钱包的所选资产余额为 0，没有可归集数量。")
+        tx = {
+            "chainId": self.network.chain_id,
+            "from": request.sender,
+            "to": request.token or request.recipient,
+            "value": 0 if contract else 1,
+            "data": contract.encode_abi("transfer", args=[request.recipient, available])
+            if contract
+            else "0x",
+            "nonce": self.web3.eth.get_transaction_count(request.sender, "pending"),
+        }
+        block = self.web3.eth.get_block("latest")
+        tx.update(self._fee_fields(block))
+        price = tx.get("maxFeePerGas", tx.get("gasPrice", 0))
+        tx["gas"] = self._gas_limit(tx, block)
+        # A recipient contract can require different gas for the final value.
+        # Grow the reservation until the final transfer fits; never assume 21,000 gas.
+        for _ in range(5):
+            fee = tx["gas"] * price
+            if native < fee + extra_reserve:
+                raise UserError("原生币余额不足以支付执行手续费和额外预留。")
+            units = available if contract else native - fee - extra_reserve
+            if units <= 0:
+                raise UserError("扣除手续费和额外预留后，没有可归集数量。")
+            if not contract:
+                tx["value"] = units
+            required = self._gas_limit(tx, block)
+            if required <= tx["gas"]:
+                break
+            tx["gas"] = required
+        else:
+            raise UserError("归集手续费估算未稳定，请稍后重试或手动填写数量。")
+        request = TransferRequest(
+            request.sender, request.recipient, format_units(units, decimals), request.token
+        )
         self._balances_and_simulation(request, tx)
+        if self.web3.eth.get_balance(request.sender, "pending") < tx["value"] + fee + extra_reserve:
+            raise UserError("计算期间钱包余额已变化，请重新计算。")
+        prepared = self._prepared(request, tx, decimals, units)
+        prepared.preview["collection"] = {
+            "balance_units": str(available),
+            "native_balance_wei": str(native),
+            "extra_reserve_wei": str(extra_reserve),
+        }
+        return prepared
+
+    def _prepared(self, request, tx, decimals, units):
         fee_price = tx.get("maxFeePerGas", tx.get("gasPrice"))
         preview = {
             "network": self.network.name,
