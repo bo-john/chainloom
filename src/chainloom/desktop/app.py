@@ -6,6 +6,7 @@ from PySide6.QtCore import QLockFile, QStandardPaths, QTimer
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from ..backup import active_directory, select_directory
 from ..diagnostics import (
     LOGGER,
     close_logging,
@@ -13,6 +14,7 @@ from ..diagnostics import (
     exception_hooks,
     record_exception,
 )
+from ..errors import UserError
 from .macos import relaunch_as_app
 from .settings import load_preferences
 from .shutdown import TerminationSignals
@@ -60,29 +62,53 @@ def main(argv=None):
                     )
                     return 1
                 try:
-                    return _run(app, args, directory, logfile)
+                    return _run_directories(app, args, directory, logfile)
                 finally:
                     lock.unlock()
             except Exception as error:  # noqa: BLE001 - log startup failures without payloads
                 record_exception("应用启动或运行", error)
-                QMessageBox.critical(None, "应用启动失败", "详细错误已写入日志：\n" + str(logfile))
+                message = (
+                    str(error)
+                    if isinstance(error, UserError)
+                    else "详细错误已写入日志：\n" + str(logfile)
+                )
+                QMessageBox.critical(None, "应用启动失败", message)
                 return 1
     finally:
         LOGGER.info("桌面应用已退出")
         close_logging()
 
 
-def _run(app, args, directory, logfile):
+def _run_directories(app, args, entry_directory, logfile):
+    directory = active_directory(entry_directory)
+    while True:
+        # Keep the launch directory locked too, so two app instances cannot change
+        # its active-directory selection or operate on the same restored data.
+        lock = None
+        if directory != entry_directory:
+            lock = QLockFile(str(directory / "desktop.lock"))
+            if not lock.tryLock(0):
+                raise UserError("恢复的数据目录正在被另一个 Chainloom 使用，请先关闭对应窗口。")
+        try:
+            result, next_directory = _run(app, args, directory, logfile, entry_directory)
+        finally:
+            if lock is not None:
+                lock.unlock()
+        if next_directory is None:
+            return result
+        directory = next_directory
+
+
+def _run(app, args, directory, logfile, entry_directory=None):
     try:
         preferences = load_preferences(directory)
     except ValueError as error:
         record_exception("读取应用设置", error)
         QMessageBox.critical(None, "无法读取设置", str(error))
-        return 1
+        return 1, None
     window = MainWindow(directory, preferences)
     window.log_directory = logfile.parent
     window.log_path_label.setText("错误日志：\n" + str(logfile))
-    window.show()
     if args.screenshot:
 
         def capture():
@@ -95,14 +121,20 @@ def _run(app, args, directory, logfile):
         QTimer.singleShot(1800, capture)
     signals = TerminationSignals(window.request_shutdown, app)
     try:
+        if entry_directory is not None and active_directory(entry_directory) != directory:
+            select_directory(entry_directory, directory)
+        window.show()
         result = app.exec()
     finally:
+        window.closing = True
         window.stop_event.set()
         window.pool.waitForDone()
         window.batch_page.shutdown()
         window.wallet_page.shutdown()
         signals.close()
-    return result
+        window.deleteLater()
+        app.processEvents()
+    return result, window.restart_directory
 
 
 if __name__ == "__main__":

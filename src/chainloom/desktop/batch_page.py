@@ -1192,7 +1192,7 @@ class BatchPage(QWidget):
         )
 
     def tick(self):
-        if self.busy or self.previewing or self.window.closing:
+        if self.busy or self.previewing or self.window.closing or self.window.maintenance:
             return
         batch_id = self.executing_id or self.selected_id
         if not batch_id:

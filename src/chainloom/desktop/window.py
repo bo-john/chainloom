@@ -31,6 +31,7 @@ from ..diagnostics import log_directory, record_exception, record_operation
 from ..errors import UserError
 from ..time_format import format_beijing_time
 from ..transfer import address
+from .backup_dialog import open_backup
 from .batch_page import BatchPage
 from .dialogs import ConfirmDialog, TokenDialog
 from .service import DesktopService, format_units, friendly_error
@@ -87,6 +88,8 @@ class MainWindow(QMainWindow):
         self.manual_refresh_requested = False
         self.closing = False
         self.force_close = False
+        self.maintenance = False
+        self.restart_directory = None
         self.task_succeeded.connect(self._task_success)
         self.task_failed.connect(self._task_failure)
         self._build()
@@ -384,6 +387,14 @@ class MainWindow(QMainWindow):
         self.change_password_button = action("修改钱包库密码", self._change_vault_password)
         security.addWidget(row(self.change_password_button, None))
 
+        backup = section(
+            "备份与恢复",
+            "创建加密备份包，包含钱包、交易、批次及已保存设置。恢复时新建目录，保留当前数据。",
+        )
+        self.backup_button = action("创建加密备份", lambda: open_backup(self))
+        self.restore_button = action("恢复备份", lambda: open_backup(self, restoring=True))
+        backup.addWidget(row(self.backup_button, self.restore_button, None))
+
         network = section("网络节点", "留空使用内置公共节点及备用节点。自定义节点只影响当前 Mac。")
         self.rpc_inputs = {}
         for name, info in NETWORKS.items():
@@ -402,18 +413,25 @@ class MainWindow(QMainWindow):
         data_path = text(str(self.directory), "settingsPath", True)
         data_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         storage.addWidget(data_path)
-        storage.addWidget(row(action("打开本地数据文件夹", lambda: QDesktopServices.openUrl(
-            QUrl.fromLocalFile(str(self.directory))
-        )), None))
+        storage.addWidget(
+            row(
+                action(
+                    "打开本地数据文件夹",
+                    lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.directory))),
+                ),
+                None,
+            )
+        )
 
         logs = section("日志与诊断", "操作遇到问题时，可打开日志文件夹查看错误详情。")
         self.log_directory = log_directory()
         self.log_path_label = text(str(self.log_directory / "chainloom.log"), "settingsPath", True)
         self.log_path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         logs.addWidget(self.log_path_label)
-        self.log_folder_button = action("打开日志文件夹", lambda: QDesktopServices.openUrl(
-            QUrl.fromLocalFile(str(self.log_directory))
-        ))
+        self.log_folder_button = action(
+            "打开日志文件夹",
+            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.log_directory))),
+        )
         logs.addWidget(row(self.log_folder_button, None))
         layout.addStretch()
         scroll = QScrollArea()
@@ -445,10 +463,10 @@ class MainWindow(QMainWindow):
         self.navigate(3)
         self.wallet_page.tabs.setCurrentIndex(1)
 
-    def _task(self, function, args=(), success=None, failure=None):
+    def _task(self, function, args=(), success=None, failure=None, *, maintenance=False):
         import uuid
 
-        if self.closing:
+        if self.closing or (self.maintenance and not maintenance):
             return
         task_id = uuid.uuid4().hex
         worker = Worker(function, *args, cancelled=self.stop_event, task_id=task_id)
@@ -918,7 +936,7 @@ class MainWindow(QMainWindow):
         return self.records[index] if 0 <= index < len(self.records) else None
 
     def poll(self, force=False, request_ids=None):
-        if self.closing:
+        if self.closing or self.maintenance:
             return
         if force:
             request_ids = (

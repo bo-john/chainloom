@@ -693,7 +693,7 @@ class WalletManagementPage(QWidget):
 
         self.run_task(work, success=done, failure=failed)
 
-    def lock(self):
+    def lock(self, *, notify=True):
         if self.notification_dialog is not None:
             self.notification_dialog.reject()
         if self.operation is not None:
@@ -703,7 +703,8 @@ class WalletManagementPage(QWidget):
             if isinstance(dialog, QDialog) and self.isAncestorOf(dialog):
                 dialog.reject()
         self.refresh()
-        self.notify("钱包库已锁定。" + ("正在停止后台加密操作…" if self.busy else ""))
+        if notify:
+            self.notify("钱包库已锁定。" + ("正在停止后台加密操作…" if self.busy else ""))
 
     def shutdown(self):
         self._shutting_down = True

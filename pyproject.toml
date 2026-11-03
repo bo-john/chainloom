@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Local desktop application for encrypted wallets and EVM transfers"
 requires-python = ">=3.13"
 dependencies = [
+    "pycryptodome>=3.24,<4",
     "pyside6==6.10.2",
     "web3>=7.14,<8",
 ]

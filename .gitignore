@@ -210,10 +210,48 @@ tempCodeRunnerFile.py
 # Chainloom local configuration, signed transactions and encrypted wallets
 .chainloom/
 chainloom.toml
+settings.json
+settings.*.json
+settings-*.tmp
+desktop.lock
 keystores/
 *.keystore.json
 wallets-vault.sqlite3*
 .wallet-vault-*.tmp
+# SQLite databases, journal/WAL files and database backups
+*.sqlite
+*.sqlite-*
+*.sqlite.*
+*.sqlite3
+*.sqlite3-*
+*.sqlite3.*
+*.db
+*.db-*
+*.db.*
+# Wallet imports, balance/transaction exports; keep the public blank template
+*.csv
+*.tsv
+!/batch-template.csv
+# Local backup folders and archives (may contain wallet data or credentials)
+backup/
+backups/
+exports/
+*.bak
+*.backup
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+*.tar.bz2
+*.tar.xz
+# Chainloom authenticated backups, restored directories and local directory selection
+*.chainloom-backup
+Chainloom-Restored-*/
+active-data.json
+.active-data-*
+.chainloom-backup-*
 node_modules/
 .DS_Store
 
